@@ -2628,6 +2628,16 @@ bool ImGuiListClipper::Step()
         IM_ASSERT(ItemsHeight > 0.0f && "Unable to calculate item height! First item hasn't moved the cursor vertically!");
         calc_clipping = true;   // If item height had to be calculated, calculate clipping afterwards.
     }
+            IM_ASSERT(table->RowPosY1 == StartPosY && table->RowPosY2 == window->DC.CursorPos.y);
+
+        ItemsHeight = (window->DC.CursorPos.y - StartPosY) / (float)(DisplayEnd - DisplayStart);
+        bool affected_by_floating_point_precision = ImIsFloatAboveGuaranteedIntegerPrecision(StartPosY) || ImIsFloatAboveGuaranteedIntegerPrecision(window->DC.CursorPos.y);
+        if (affected_by_floating_point_precision)
+            ItemsHeight = window->DC.PrevLineSize.y + g.Style.ItemSpacing.y; // FIXME: Technically wouldn't allow multi-line entries.
+
+        IM_ASSERT(ItemsHeight > 0.0f && "Unable to calculate item height! First item hasn't moved the cursor vertically!");
+        calc_clipping = true;   // If item height had to be calculated, calculate clipping afterwards.
+    }
 
     // Step 0 or 1: Calculate the actual ranges of visible elements.
     const int already_submitted = DisplayEnd;
@@ -2658,6 +2668,59 @@ bool ImGuiListClipper::Step()
             data->Ranges.push_back(ImGuiListClipperRange::FromPositions(window->ClipRect.Min.y, window->ClipRect.Max.y, off_min, off_max));
         }
 
+    // Step 0 or 1: Calculate the actual ranges of visible elements.
+    const int already_submitted = DisplayEnd;
+    if (calc_clipping)
+    {
+        if (g.LogEnabled)
+        {
+            // If logging is active, do not perform any clipping
+            data->Ranges.push_back(ImGuiListClipperRange::FromIndices(0, ItemsCount));
+        }
+        else
+        {
+            // Add range selected to be included for navigation
+            const bool is_nav_request = (g.NavMoveScoringItems && g.NavWindow && g.NavWindow->RootWindowForNav == window->RootWindowForNav);
+            if (is_nav_request)
+                data->Ranges.push_back(ImGuiListClipperRange::FromPositions(g.NavScoringNoClipRect.Min.y, g.NavScoringNoClipRect.Max.y, 0, 0));
+            if (is_nav_request && (g.NavMoveFlags & ImGuiNavMoveFlags_Tabbing) && g.NavTabbingDir == -1)
+                data->Ranges.push_back(ImGuiListClipperRange::FromIndices(ItemsCount - 1, ItemsCount));
+
+            // Add focused/active item
+            ImRect nav_rect_abs = ImGui::WindowRectRelToAbs(window, window->NavRectRel[0]);
+            if (g.NavId != 0 && window->NavLastIds[0] == g.NavId)
+                data->Ranges.push_back(ImGuiListClipperRange::FromPositions(nav_rect_abs.Min.y, nav_rect_abs.Max.y, 0, 0));
+
+            // Add visible range
+            const int off_min = (is_nav_request && g.NavMoveClipDir == ImGuiDir_Up) ? -1 : 0;
+            const int off_max = (is_nav_request && g.NavMoveClipDir == ImGuiDir_Down) ? 1 : 0;
+            data->Ranges.push_back(ImGuiListClipperRange::FromPositions(window->ClipRect.Min.y, window->ClipRect.Max.y, off_min, off_max));
+        }
+
+        // Convert position ranges to item index ranges
+        // - Very important: when a starting position is after our maximum item, we set Min to (ItemsCount - 1). This allows us to handle most forms of wrapping.
+        // - Due to how Selectable extra padding they tend to be "unaligned" with exact unit in the item list,
+        //   which with the flooring/ceiling tend to lead to 2 items instead of one being submitted.
+        for (int i = 0; i < data->Ranges.Size; i++)
+            if (data->Ranges[i].PosToIndexConvert)
+            {
+                int m1 = (int)(((double)data->Ranges[i].Min - window->DC.CursorPos.y - data->LossynessOffset) / ItemsHeight);
+                int m2 = (int)((((double)data->Ranges[i].Max - window->DC.CursorPos.y - data->LossynessOffset) / ItemsHeight) + 0.999999f);
+                data->Ranges[i].Min = ImClamp(already_submitted + m1 + data->Ranges[i].PosToIndexOffsetMin, already_submitted, ItemsCount - 1);
+                data->Ranges[i].Max = ImClamp(already_submitted + m2 + data->Ranges[i].PosToIndexOffsetMax, data->Ranges[i].Min + 1, ItemsCount);
+                data->Ranges[i].PosToIndexConvert = false;
+            }
+        ImGuiListClipper_SortAndFuseRanges(data->Ranges, data->StepNo);
+    }
+
+    // Step 0+ (if item height is given in advance) or 1+: Display the next range in line.
+    if (data->StepNo < data->Ranges.Size)
+    {
+        DisplayStart = ImMax(data->Ranges[data->StepNo].Min, already_submitted);
+        DisplayEnd = ImMin(data->Ranges[data->StepNo].Max, ItemsCount);
+        if (DisplayStart > already_submitted) //-V1051
+            ImGuiListClipper_SeekCursorForItem(this, DisplayStart);
+        data->StepNo++;
         // Convert position ranges to item index ranges
         // - Very important: when a starting position is after our maximum item, we set Min to (ItemsCount - 1). This allows us to handle most forms of wrapping.
         // - Due to how Selectable extra padding they tend to be "unaligned" with exact unit in the item list,
@@ -4847,8 +4910,63 @@ ImGuiWindow* ImGui::FindBottomMostVisibleWindowWithinBeginStack(ImGuiWindow* par
 }
 
 static void ImGui::RenderDimmedBackgrounds()
+static void ImGui::RenderDimmedBackgroundBehindWindow(ImGuiWindow* window, ImU32 col)
+{
+    if ((col & IM_COL32_A_MASK) == 0)
+        return;
+
+    ImGuiViewportP* viewport = window->Viewport;
+    ImRect viewport_rect = viewport->GetMainRect();
+
+    // Draw behind window by moving the draw command at the FRONT of the draw list
+    {
+        // We've already called AddWindowToDrawData() which called DrawList->ChannelsMerge() on DockNodeHost windows,
+        // and draw list have been trimmed already, hence the explicit recreation of a draw command if missing.
+        ImDrawList* draw_list = window->RootWindowDockTree->DrawList;
+        if (draw_list->CmdBuffer.Size == 0)
+            draw_list->AddDrawCmd();
+        draw_list->PushClipRect(viewport_rect.Min - ImVec2(1, 1), viewport_rect.Max + ImVec2(1, 1), false); // Ensure ImDrawCmd are not merged
+        draw_list->AddRectFilled(viewport_rect.Min, viewport_rect.Max, col);
+        ImDrawCmd cmd = draw_list->CmdBuffer.back();
+        IM_ASSERT(cmd.ElemCount == 6);
+        draw_list->CmdBuffer.pop_back();
+        draw_list->CmdBuffer.push_front(cmd);
+        draw_list->PopClipRect();
+        draw_list->_PopUnusedDrawCmd(); // Since are past the calls to AddDrawListToDrawData() we don't have a _PopUnusedDrawCmd() running on commands.
+    }
+
+    // Draw over sibling docking nodes in a same docking tree
+    if (window->RootWindow->DockIsActive)
+    {
+        ImDrawList* draw_list = FindFrontMostVisibleChildWindow(window->RootWindowDockTree)->DrawList;
+        draw_list->PushClipRect(viewport_rect.Min, viewport_rect.Max, false);
+        RenderRectFilledWithHole(draw_list, window->RootWindowDockTree->Rect(), window->RootWindow->Rect(), col, 0.0f);// window->RootWindowDockTree->WindowRounding);
+        draw_list->PopClipRect();
+        draw_list->_PopUnusedDrawCmd();
+    }
+}
+
+ImGuiWindow* ImGui::FindBottomMostVisibleWindowWithinBeginStack(ImGuiWindow* parent_window)
 {
     ImGuiContext& g = *GImGui;
+    ImGuiWindow* bottom_most_visible_window = parent_window;
+    for (int i = FindWindowDisplayIndex(parent_window); i >= 0; i--)
+    {
+        ImGuiWindow* window = g.Windows[i];
+        if (window->Flags & ImGuiWindowFlags_ChildWindow)
+            continue;
+        if (!IsWindowWithinBeginStackOf(window, parent_window))
+            break;
+        if (IsWindowActiveAndVisible(window) && GetWindowDisplayLayer(window) <= GetWindowDisplayLayer(parent_window))
+            bottom_most_visible_window = window;
+    }
+    return bottom_most_visible_window;
+}
+
+static void ImGui::RenderDimmedBackgrounds()
+{
+    ImGuiContext& g = *GImGui;
+    ImGuiWindow* modal_window = GetTopMostAndVisiblePopupModal();
     ImGuiWindow* modal_window = GetTopMostAndVisiblePopupModal();
     const bool dim_bg_for_modal = (modal_window != NULL);
     const bool dim_bg_for_window_list = (g.NavWindowingTargetAnim != NULL && g.NavWindowingTargetAnim->Active);
@@ -7400,6 +7518,19 @@ bool ImGui::IsWindowChildOf(ImGuiWindow* window, ImGuiWindow* potential_parent, 
         if (window == window_root) // end of chain
             return false;
         window = window->ParentWindow;
+    }
+    return false;
+}
+
+bool ImGui::IsWindowWithinBeginStackOf(ImGuiWindow* window, ImGuiWindow* potential_parent)
+{
+    if (window->RootWindow == potential_parent)
+        return true;
+    while (window != NULL)
+    {
+        if (window == potential_parent)
+            return true;
+        window = window->ParentWindowInBeginStack;
     }
     return false;
 }
@@ -10115,6 +10246,16 @@ ImGuiWindow* ImGui::GetTopMostPopupModal()
     for (int n = g.OpenPopupStack.Size - 1; n >= 0; n--)
         if (ImGuiWindow* popup = g.OpenPopupStack.Data[n].Window)
             if (popup->Flags & ImGuiWindowFlags_Modal)
+                return popup;
+    return NULL;
+}
+
+ImGuiWindow* ImGui::GetTopMostAndVisiblePopupModal()
+{
+    ImGuiContext& g = *GImGui;
+    for (int n = g.OpenPopupStack.Size - 1; n >= 0; n--)
+        if (ImGuiWindow* popup = g.OpenPopupStack.Data[n].Window)
+            if ((popup->Flags & ImGuiWindowFlags_Modal) && IsWindowActiveAndVisible(popup))
                 return popup;
     return NULL;
 }
@@ -15912,6 +16053,17 @@ static bool DockNodeIsDropAllowedOne(ImGuiWindow* payload, ImGuiWindow* host_win
             if (ImGui::IsWindowWithinBeginStackOf(payload, popup_window))   // Payload is created from within a popup begin stack.
                 return false;
 
+    // Prevent docking any window created above a popup
+    // Technically we should support it (e.g. in the case of a long-lived modal window that had fancy docking features),
+    // by e.g. adding a 'if (!ImGui::IsWindowWithinBeginStackOf(host_window, popup_window))' test.
+    // But it would requires more work on our end because the dock host windows is technically created in NewFrame()
+    // and our ->ParentXXX and ->RootXXX pointers inside windows are currently mislading or lacking.
+    ImGuiContext& g = *GImGui;
+    for (int i = g.OpenPopupStack.Size - 1; i >= 0; i--)
+        if (ImGuiWindow* popup_window = g.OpenPopupStack[i].Window)
+            if (ImGui::IsWindowWithinBeginStackOf(payload, popup_window))   // Payload is created from within a popup begin stack.
+                return false;
+
     return true;
 }
 
@@ -17868,6 +18020,49 @@ static void SetClipboardTextFn_DefaultImpl(void*, const char* text)
     memcpy(&g.ClipboardHandlerData[0], text, (size_t)(text_end - text));
     g.ClipboardHandlerData[(int)(text_end - text)] = 0;
 }
+
+#endif
+
+// Win32 API IME support (for Asian languages, etc.)
+#if defined(_WIN32) && !defined(IMGUI_DISABLE_WIN32_FUNCTIONS) && !defined(IMGUI_DISABLE_WIN32_DEFAULT_IME_FUNCTIONS)
+
+#include <imm.h>
+#ifdef _MSC_VER
+#pragma comment(lib, "imm32")
+#endif
+
+static void SetPlatformImeDataFn_DefaultImpl(ImGuiViewport* viewport, ImGuiPlatformImeData* data)
+{
+    // Notify OS Input Method Editor of text input position
+    HWND hwnd = (HWND)viewport->PlatformHandleRaw;
+#ifndef IMGUI_DISABLE_OBSOLETE_FUNCTIONS
+    if (hwnd == 0)
+        hwnd = (HWND)ImGui::GetIO().ImeWindowHandle;
+#endif
+    if (hwnd == 0)
+        return;
+
+    ::ImmAssociateContextEx(hwnd, NULL, data->WantVisible ? IACE_DEFAULT : 0);
+
+    if (HIMC himc = ::ImmGetContext(hwnd))
+    {
+        COMPOSITIONFORM composition_form = {};
+        composition_form.ptCurrentPos.x = (LONG)(data->InputPos.x - viewport->Pos.x);
+        composition_form.ptCurrentPos.y = (LONG)(data->InputPos.y - viewport->Pos.y);
+        composition_form.dwStyle = CFS_FORCE_POSITION;
+        ::ImmSetCompositionWindow(himc, &composition_form);
+        CANDIDATEFORM candidate_form = {};
+        candidate_form.dwStyle = CFS_CANDIDATEPOS;
+        candidate_form.ptCurrentPos.x = (LONG)(data->InputPos.x - viewport->Pos.x);
+        candidate_form.ptCurrentPos.y = (LONG)(data->InputPos.y - viewport->Pos.y);
+        ::ImmSetCandidateWindow(himc, &candidate_form);
+        ::ImmReleaseContext(hwnd, himc);
+    }
+}
+
+#else
+
+static void SetPlatformImeDataFn_DefaultImpl(ImGuiViewport*, ImGuiPlatformImeData*) {}
 
 #endif
 

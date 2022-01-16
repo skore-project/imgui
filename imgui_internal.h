@@ -1297,6 +1297,35 @@ struct ImGuiListClipperData
 };
 
 //-----------------------------------------------------------------------------
+// [SECTION] Clipper support
+//-----------------------------------------------------------------------------
+
+struct ImGuiListClipperRange
+{
+    int     Min;
+    int     Max;
+    bool    PosToIndexConvert;      // Begin/End are absolute position (will be converted to indices later)
+    ImS8    PosToIndexOffsetMin;    // Add to Min after converting to indices
+    ImS8    PosToIndexOffsetMax;    // Add to Min after converting to indices
+
+    static ImGuiListClipperRange    FromIndices(int min, int max)                               { ImGuiListClipperRange r = { min, max, false, 0, 0 }; return r; }
+    static ImGuiListClipperRange    FromPositions(float y1, float y2, int off_min, int off_max) { ImGuiListClipperRange r = { (int)y1, (int)y2, true, (ImS8)off_min, (ImS8)off_max }; return r; }
+};
+
+// Temporary clipper data, buffers shared/reused between instances
+struct ImGuiListClipperData
+{
+    ImGuiListClipper*               ListClipper;
+    float                           LossynessOffset;
+    int                             StepNo;
+    int                             ItemsFrozen;
+    ImVector<ImGuiListClipperRange> Ranges;
+
+    ImGuiListClipperData()          { memset(this, 0, sizeof(*this)); }
+    void                            Reset(ImGuiListClipper* clipper) { ListClipper = clipper; StepNo = ItemsFrozen = 0; Ranges.resize(0); }
+};
+
+//-----------------------------------------------------------------------------
 // [SECTION] Navigation support
 //-----------------------------------------------------------------------------
 
